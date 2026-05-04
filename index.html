@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DrowsGuard — Driver Monitoring</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;500;700;900&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Design tokens ─────────────────────────────────────────────────────── */
+    :root {
+      --bg:         #080a0d;
+      --panel:      #0d1117;
+      --border:     #1c2433;
+      --border-hi:  #2a3a52;
+      --text:       #c9d4e0;
+      --muted:      #4a5a6a;
+      --mono:       'Share Tech Mono', monospace;
+      --display:    'Barlow Condensed', sans-serif;
+
+      --alert-color:  #00e5a0;
+      --warn-color:   #f5a623;
+      --danger-color: #ff3b5c;
+      --info-color:   #3b82f6;
+
+      --bar-h: 3px;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--display);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    /* ── Scanline overlay ──────────────────────────────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(
+        to bottom,
+        transparent 0px,
+        transparent 2px,
+        rgba(0,0,0,0.08) 2px,
+        rgba(0,0,0,0.08) 4px
+      );
+      pointer-events: none;
+      z-index: 999;
+    }
+
+    /* ── Top bar ───────────────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 28px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      position: sticky; top: 0; z-index: 100;
+    }
+
+    .logo {
+      font-family: var(--display);
+      font-weight: 900;
+      font-size: 1.5rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #fff;
+    }
+    .logo span { color: var(--alert-color); }
+
+    .header-meta {
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+      text-align: right;
+      line-height: 1.6;
+    }
+
+    #clock { color: var(--text); }
+
+    /* ── Status bar ────────────────────────────────────────────────────────── */
+    #status-bar {
+      height: var(--bar-h);
+      background: var(--border);
+      position: relative;
+      overflow: hidden;
+    }
+    #status-bar-fill {
+      position: absolute; left: 0; top: 0; bottom: 0;
+      width: 0%;
+      background: var(--alert-color);
+      transition: width 0.3s ease, background 0.4s ease;
+    }
+
+    /* ── Main layout ───────────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      grid-template-rows: 1fr auto;
+      gap: 0;
+      max-width: 1200px;
+      margin: 0 auto;
+      width: 100%;
+      padding: 24px;
+      gap: 20px;
+    }
+
+    /* ── Camera panel ──────────────────────────────────────────────────────── */
+    #camera-panel {
+      position: relative;
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+      aspect-ratio: 4/3;
+      max-height: 540px;
+    }
+
+    #video {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      display: block;
+      transform: scaleX(-1); /* mirror */
+    }
+
+    /* Corner brackets */
+    #camera-panel::before, #camera-panel::after,
+    .corner-br, .corner-bl {
+      content: '';
+      position: absolute;
+      width: 24px; height: 24px;
+      border-color: var(--alert-color);
+      border-style: solid;
+      z-index: 10;
+      transition: border-color 0.4s;
+    }
+    #camera-panel::before { top: 12px; left: 12px;
+      border-width: 2px 0 0 2px; }
+    #camera-panel::after  { top: 12px; right: 12px;
+      border-width: 2px 2px 0 0; }
+    .corner-br { bottom: 12px; right: 12px;
+      border-width: 0 2px 2px 0; }
+    .corner-bl { bottom: 12px; left: 12px;
+      border-width: 0 0 2px 2px; }
+
+    /* Overlay label */
+    #camera-label {
+      position: absolute; top: 12px; left: 50%;
+      transform: translateX(-50%);
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      letter-spacing: 0.15em;
+      color: var(--muted);
+      z-index: 10;
+    }
+
+    /* Alert flash overlay */
+    #alert-overlay {
+      position: absolute; inset: 0;
+      pointer-events: none;
+      z-index: 20;
+      opacity: 0;
+      transition: opacity 0.2s;
+      border: 3px solid var(--danger-color);
+      box-shadow: inset 0 0 60px rgba(255,59,92,0.25);
+    }
+    #alert-overlay.active { animation: flash 0.8s ease infinite; }
+
+    @keyframes flash {
+      0%, 100% { opacity: 0; }
+      50%       { opacity: 1; }
+    }
+
+    /* ── Side panel ────────────────────────────────────────────────────────── */
+    #side-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* ── Widget card ───────────────────────────────────────────────────────── */
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 16px;
+    }
+    .card-label {
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    /* ── Status widget ─────────────────────────────────────────────────────── */
+    #status-widget {
+      text-align: center;
+      padding: 20px 16px;
+    }
+
+    #status-icon {
+      font-size: 2.8rem;
+      line-height: 1;
+      margin-bottom: 8px;
+      display: block;
+      transition: all 0.3s;
+    }
+
+    #status-text {
+      font-family: var(--display);
+      font-weight: 900;
+      font-size: 2rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      transition: color 0.4s;
+    }
+
+    #status-text.alert  { color: var(--alert-color); }
+    #status-text.drowsy { color: var(--danger-color); animation: pulse-text 1s ease infinite; }
+    #status-text.warn   { color: var(--warn-color); }
+
+    @keyframes pulse-text {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.6; }
+    }
+
+    /* ── Confidence meter ──────────────────────────────────────────────────── */
+    #confidence-value {
+      font-family: var(--mono);
+      font-size: 2.4rem;
+      color: #fff;
+      text-align: center;
+      margin-bottom: 10px;
+      letter-spacing: 0.05em;
+    }
+
+    .meter-track {
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 6px;
+    }
+    .meter-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.3s ease, background 0.4s ease;
+      background: var(--alert-color);
+    }
+    .meter-labels {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      color: var(--muted);
+    }
+
+    /* ── Buffer progress ───────────────────────────────────────────────────── */
+    #buffer-track {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    #buffer-fill {
+      height: 100%;
+      background: var(--info-color);
+      border-radius: 2px;
+      transition: width 0.2s;
+    }
+    #buffer-label {
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      color: var(--muted);
+      margin-top: 4px;
+      text-align: right;
+    }
+
+    /* ── Event log ─────────────────────────────────────────────────────────── */
+    #log-list {
+      list-style: none;
+      max-height: 160px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-hi) transparent;
+    }
+    #log-list li {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      color: var(--muted);
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 8px;
+    }
+    #log-list li .log-time { color: var(--border-hi); flex-shrink: 0; }
+    #log-list li.log-danger { color: var(--danger-color); }
+    #log-list li.log-warn   { color: var(--warn-color); }
+    #log-list li.log-ok     { color: var(--alert-color); }
+
+    /* ── Controls ──────────────────────────────────────────────────────────── */
+    #controls {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .btn {
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 0.85rem;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      padding: 10px 28px;
+      border: 1px solid var(--border-hi);
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      border-radius: 2px;
+      transition: all 0.2s;
+    }
+    .btn:hover { border-color: var(--alert-color); color: var(--alert-color); }
+    .btn.primary {
+      background: var(--alert-color);
+      border-color: var(--alert-color);
+      color: #000;
+    }
+    .btn.primary:hover { background: #00ffb3; border-color: #00ffb3; }
+    .btn.danger {
+      border-color: var(--danger-color);
+      color: var(--danger-color);
+    }
+    .btn.danger:hover { background: var(--danger-color); color: #fff; }
+    .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    #fps-label {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      color: var(--muted);
+      margin-left: auto;
+    }
+
+    /* ── Responsive ────────────────────────────────────────────────────────── */
+    @media (max-width: 780px) {
+      main { grid-template-columns: 1fr; padding: 12px; }
+      #controls { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="logo">Drows<span>Guard</span></div>
+    <div class="header-meta">
+      DRIVER MONITORING SYSTEM v1.0<br>
+      <span id="clock">--:--:--</span>
+    </div>
+  </header>
+
+  <div id="status-bar"><div id="status-bar-fill"></div></div>
+
+  <main>
+
+    <!-- Camera -->
+    <div id="camera-panel">
+      <video id="video" autoplay muted playsinline></video>
+      <div class="corner-br"></div>
+      <div class="corner-bl"></div>
+      <div id="camera-label">CAM-01 / FACE MONITOR</div>
+      <div id="alert-overlay"></div>
+    </div>
+
+    <!-- Side panel -->
+    <div id="side-panel">
+
+      <!-- Status -->
+      <div class="card" id="status-widget">
+        <div class="card-label">Driver State</div>
+        <span id="status-icon">😐</span>
+        <div id="status-text">STANDBY</div>
+      </div>
+
+      <!-- Confidence -->
+      <div class="card">
+        <div class="card-label">Drowsiness Score</div>
+        <div id="confidence-value">--.-%</div>
+        <div class="meter-track">
+          <div class="meter-fill" id="meter-fill" style="width:0%"></div>
+        </div>
+        <div class="meter-labels"><span>ALERT</span><span>DROWSY</span></div>
+
+        <!-- Buffer warmup -->
+        <div id="buffer-track"><div id="buffer-fill" style="width:0%"></div></div>
+        <div id="buffer-label">BUFFER: 0 / 30</div>
+      </div>
+
+      <!-- Event log -->
+      <div class="card" style="flex:1">
+        <div class="card-label">Event Log</div>
+        <ul id="log-list"></ul>
+      </div>
+
+    </div>
+
+    <!-- Controls -->
+    <div id="controls">
+      <button class="btn primary" id="btn-start">▶ Start Monitor</button>
+      <button class="btn danger"  id="btn-stop" disabled>■ Stop</button>
+      <span id="fps-label">-- FPS</span>
+    </div>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
