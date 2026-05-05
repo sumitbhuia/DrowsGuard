@@ -24,12 +24,15 @@ drowsiness-app/
 
 ## Step 1 — Export your model from Colab
 
+Your Colab uses TF 2.20 / Keras 3.13 — save in `.keras` format (native Keras 3.x).
 Add this cell at the end of your Colab notebook and run it:
 
 ```python
-# Save & download the trained LSTM
+# Save LSTM in native Keras 3.x format
+model.save('/content/best_model.keras')
+
 from google.colab import files
-files.download('/content/best_model.h5')
+files.download('/content/best_model.keras')
 
 # Optional but recommended — saves MobileNetV2 so server loads faster
 from tensorflow.keras.applications import MobileNetV2
@@ -38,25 +41,24 @@ cnn.save('/content/mobilenetv2_feature_extractor.h5')
 files.download('/content/mobilenetv2_feature_extractor.h5')
 ```
 
-Place the downloaded `.h5` files in the project root (same folder as `main.py`).
+Place the downloaded files in the project root (same folder as `main.py`).
+The server will find `best_model.keras` automatically — no config needed.
 
 ---
 
-## Step 2 — First-time local setup
+## Step 2 — First-time local setup (macOS)
 
 ```bash
-# 1. Clone / navigate to project folder
 cd drowsiness-app
 
-# 2. Create virtual environment (isolated — won't touch system Python)
-python3 -m venv venv
+# Create venv with Python 3.11 (installed via pyenv)
+python3.11 -m venv venv
+source venv/bin/activate
 
-# 3. Activate it
-source venv/bin/activate        # Mac / Linux
-# venv\Scripts\activate         # Windows
+pip install --upgrade pip
 
-# 4. Install dependencies (~1-1.5GB, one-time)
-pip install -r requirements.txt
+# Use the MAC requirements — NOT requirements.txt (that's for Render/Linux)
+pip install -r requirements-mac.txt
 ```
 
 ---
@@ -78,18 +80,20 @@ Open your browser:
 
 ## Step 4 — Deploy to Render (free)
 
-1. Push this folder to a GitHub repo  
-   *(the `.h5` files are in `.gitignore` — upload them manually or use Git LFS)*
+1. Push this folder to a GitHub repo
+   *(`.h5`/`.keras` model files are in `.gitignore` — upload them via Render's Persistent Disk or store in a private S3 bucket)*
 2. Go to [render.com](https://render.com) → **New Web Service** → connect repo
-3. Settings:
-   - **Build command:** `pip install -r requirements.txt`
+3. Render will auto-detect `render.yaml` — no manual settings needed
+4. Or set manually:
+   - **Build command:** `pip install -r requirements.txt`  ← Linux, no metal
    - **Start command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
-   - **Instance:** Free (upgrade to $7/mo Starter if you hit RAM limits)
-4. Add model files via Render's **Persistent Disk** or store them in a private S3 bucket
+   - **Instance:** Free (upgrade to $7/mo Starter if RAM exceeded)
 
-### Keep Render warm (avoid cold start latency)
-Set up a free [UptimeRobot](https://uptimerobot.com) monitor on:
-`https://your-app.onrender.com/health` — ping every 5 minutes.
+> ⚠️ Never set Render's build command to `requirements-mac.txt` — that file has `tensorflow-metal` which will crash on Linux.
+
+### Keep Render warm
+Set up a free [UptimeRobot](https://uptimerobot.com) monitor pinging:
+`https://your-app.onrender.com/health` every 5 minutes.
 
 ---
 

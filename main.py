@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from inference import process_frame, clear_session
+from inference import process_frame, calibrate_frame, clear_session
 
 app = FastAPI(title="Driver Drowsiness Detection API")
 
@@ -39,6 +39,26 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── Calibration endpoint ──────────────────────────────────────────────────────
+@app.post("/calibrate")
+async def calibrate(
+    frame: UploadFile = File(..., description="JPEG frame during alert calibration"),
+    x_session_id: str = Header(default=None),
+):
+    """
+    Called during the 30-second calibration phase (before live monitoring).
+    Send frames at 10fps. Backend accumulates 300 alert-state LSTM probabilities
+    to compute a personal drowsiness threshold.
+
+    On no-face: resets calibration — frontend restarts countdown.
+    On complete: returns personal threshold used for the rest of the session.
+    """
+    session_id = x_session_id or str(uuid.uuid4())
+    jpeg_bytes = await frame.read()
+    result     = calibrate_frame(jpeg_bytes, session_id)
+    return result
 
 
 # ── Main inference endpoint ───────────────────────────────────────────────────

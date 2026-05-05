@@ -1,7 +1,10 @@
 # ─────────────────────────────────────────────────────
-# requirements.txt — Render (Linux) deployment
+# requirements-mac.txt — local macOS development only
+# DO NOT deploy this to Render
 # ─────────────────────────────────────────────────────
-tensorflow-cpu==2.17.0
+
+tensorflow==2.16.2
+tensorflow-metal==1.0.0
 fastapi
 uvicorn[standard]
 python-multipart

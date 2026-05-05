@@ -357,6 +357,84 @@
       main { grid-template-columns: 1fr; padding: 12px; }
       #controls { flex-wrap: wrap; }
     }
+
+    /* ── Calibration overlay ───────────────────────────────────────────────── */
+    #cal-overlay {
+      position: absolute; inset: 0;
+      background: rgba(8,10,13,0.88);
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      backdrop-filter: blur(2px);
+      transition: opacity 0.4s;
+    }
+    #cal-overlay.hidden { opacity: 0; pointer-events: none; }
+
+    #cal-ring {
+      position: relative;
+      width: 110px; height: 110px;
+    }
+    #cal-ring svg { transform: rotate(-90deg); }
+    #cal-ring-track { fill: none; stroke: var(--border); stroke-width: 5; }
+    #cal-ring-fill  {
+      fill: none; stroke: var(--info-color); stroke-width: 5;
+      stroke-linecap: round;
+      stroke-dasharray: 314;
+      stroke-dashoffset: 314;
+      transition: stroke-dashoffset 0.3s linear, stroke 0.4s;
+    }
+    #cal-count {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-family: var(--mono);
+      font-size: 1.6rem;
+      color: #fff;
+    }
+
+    #cal-title {
+      font-family: var(--display);
+      font-weight: 900;
+      font-size: 1.2rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #fff;
+    }
+    #cal-subtitle {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      color: var(--muted);
+      text-align: center;
+      max-width: 220px;
+      line-height: 1.7;
+      letter-spacing: 0.05em;
+    }
+    #cal-status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--info-color);
+      animation: blink 1s ease infinite;
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 1; } 50% { opacity: 0.2; }
+    }
+    #cal-overlay.reset #cal-ring-fill { stroke: var(--danger-color); }
+    #cal-overlay.reset #cal-status-dot { background: var(--danger-color); }
+    #cal-overlay.done  #cal-ring-fill { stroke: var(--alert-color); }
+    #cal-overlay.done  #cal-status-dot { background: var(--alert-color); animation: none; }
+
+    /* Threshold badge in side panel */
+    #threshold-badge {
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      color: var(--muted);
+      margin-top: 6px;
+      text-align: center;
+      letter-spacing: 0.1em;
+    }
+    #threshold-badge span { color: var(--info-color); }
   </style>
 </head>
 <body>
@@ -381,6 +459,23 @@
       <div class="corner-bl"></div>
       <div id="camera-label">CAM-01 / FACE MONITOR</div>
       <div id="alert-overlay"></div>
+
+      <!-- Calibration overlay (sits above everything inside camera panel) -->
+      <div id="cal-overlay">
+        <div id="cal-ring">
+          <svg viewBox="0 0 110 110" width="110" height="110">
+            <circle class="" id="cal-ring-track" cx="55" cy="55" r="50"/>
+            <circle id="cal-ring-fill" cx="55" cy="55" r="50"/>
+          </svg>
+          <div id="cal-count">30</div>
+        </div>
+        <div id="cal-title">Calibrating</div>
+        <div id="cal-subtitle">
+          SIT NORMALLY &amp; FACE THE CAMERA<br>
+          ESTABLISHING YOUR ALERT BASELINE
+        </div>
+        <div id="cal-status-dot"></div>
+      </div>
     </div>
 
     <!-- Side panel -->
@@ -405,6 +500,9 @@
         <!-- Buffer warmup -->
         <div id="buffer-track"><div id="buffer-fill" style="width:0%"></div></div>
         <div id="buffer-label">BUFFER: 0 / 30</div>
+
+        <!-- Personal threshold badge -->
+        <div id="threshold-badge">THRESHOLD: <span id="threshold-val">DEFAULT (50%)</span></div>
       </div>
 
       <!-- Event log -->
@@ -424,6 +522,6 @@
 
   </main>
 
-  <script src="app.js"></script>
+  <script src="static/app.js"></script>
 </body>
 </html>

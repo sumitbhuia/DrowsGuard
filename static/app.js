@@ -1,14 +1,22 @@
 /**
- * app.js — DrowsGuard frontend logic
- * Captures webcam frames at 10fps, sends to /predict, updates UI.
- * No Node.js, no build step — plain browser JS.
+ * app.js — DrowsGuard v2 frontend
+ *
+ * Session flow:
+ *   1. User clicks Start → camera opens → calibration phase (30s)
+ *   2. Calibration: frames → POST /calibrate at 10fps
+ *      - No face → backend resets → countdown restarts
+ *      - Complete → personal threshold set → live inference begins
+ *   3. Live inference: frames → POST /predict
+ *      - 3 overlapping LSTM windows → median vote → threshold compare
  */
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const API_URL     = '';          // empty = same origin (FastAPI serves this file)
-const FRAME_MS    = 100;         // 10fps
-const SESSION_ID  = crypto.randomUUID();
-const SEQ_LEN     = 30;
+const API_URL    = '';
+const FRAME_MS   = 100;               // 10fps
+const SESSION_ID = crypto.randomUUID();
+const CAL_TOTAL  = 300;               // 300 frames @ 10fps = 30s
+const BUF_TOTAL  = 60;                // large buffer for 3 overlapping windows
+const RING_C     = 2 * Math.PI * 50; // SVG circle r=50 circumference ≈ 314
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const video         = document.getElementById('video');
@@ -25,184 +33,289 @@ const alertOverlay  = document.getElementById('alert-overlay');
 const statusBarFill = document.getElementById('status-bar-fill');
 const fpsLabel      = document.getElementById('fps-label');
 const clockEl       = document.getElementById('clock');
+const thresholdVal  = document.getElementById('threshold-val');
+const calOverlay    = document.getElementById('cal-overlay');
+const calRingFill   = document.getElementById('cal-ring-fill');
+const calCount      = document.getElementById('cal-count');
+const calTitle      = document.getElementById('cal-title');
+const calSubtitle   = document.getElementById('cal-subtitle');
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let intervalId   = null;
-let stream       = null;
-let frameCount   = 0;
-let fpsTimer     = Date.now();
-let lastDrowsy   = false;
-let drowsyStart  = null;   // timestamp when drowsiness began
-const canvas     = document.createElement('canvas');
-canvas.width     = 224;
-canvas.height    = 224;
-const ctx        = canvas.getContext('2d');
+let intervalId     = null;
+let stream         = null;
+let appPhase       = 'idle';   // 'idle' | 'calibrating' | 'monitoring'
+let personalThresh = null;
+let lastDrowsy     = false;
+let drowsyStart    = null;
+let frameCount     = 0;
+let fpsTimer       = Date.now();
+let sending        = false;    // prevent overlapping fetches
+
+const canvas   = document.createElement('canvas');
+canvas.width   = 224;
+canvas.height  = 224;
+const ctx      = canvas.getContext('2d');
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
-function updateClock() {
-  const now = new Date();
-  clockEl.textContent = now.toTimeString().slice(0, 8);
-}
-setInterval(updateClock, 1000);
-updateClock();
+setInterval(() => {
+  clockEl.textContent = new Date().toTimeString().slice(0, 8);
+}, 1000);
+clockEl.textContent = new Date().toTimeString().slice(0, 8);
 
-// ── Log ───────────────────────────────────────────────────────────────────────
+// ── Logging ───────────────────────────────────────────────────────────────────
 function log(message, type = '') {
   const li   = document.createElement('li');
   const time = new Date().toTimeString().slice(0, 8);
   li.innerHTML = `<span class="log-time">${time}</span><span>${message}</span>`;
   if (type) li.classList.add(`log-${type}`);
   logList.prepend(li);
-  // Keep only last 50 entries
   while (logList.children.length > 50) logList.removeChild(logList.lastChild);
 }
 
-// ── UI update ─────────────────────────────────────────────────────────────────
-function setAlert() {
-  statusText.textContent = 'ALERT';
-  statusText.className   = 'alert';
-  statusIcon.textContent = '👁️';
-  alertOverlay.classList.remove('active');
-  meterFill.style.background = 'var(--alert-color)';
+// ── Calibration UI ────────────────────────────────────────────────────────────
+function showCalOverlay(visible) {
+  if (visible) calOverlay.classList.remove('hidden');
+  else         calOverlay.classList.add('hidden');
+}
+
+function updateCalRing(collected, target, isReset) {
+  const frac   = Math.min(collected / target, 1);
+  const offset = (RING_C * (1 - frac)).toFixed(1);
+  calRingFill.style.strokeDashoffset = offset;
+
+  const secsLeft = Math.ceil((target - collected) / 10);
+  calCount.textContent = isReset ? '!' : Math.max(secsLeft, 0);
+
+  calOverlay.classList.remove('reset', 'done');
+  if (isReset) calOverlay.classList.add('reset');
+}
+
+function calComplete(threshold) {
+  calOverlay.classList.add('done');
+  calRingFill.style.strokeDashoffset = '0';
+  calCount.textContent    = '✓';
+  calTitle.textContent    = 'Calibrated';
+  calSubtitle.textContent = `PERSONAL THRESHOLD SET TO ${Math.round(threshold * 100)}%`;
+  setTimeout(() => showCalOverlay(false), 1800);
+}
+
+// ── Status UI ─────────────────────────────────────────────────────────────────
+function setStateAlert() {
+  statusText.textContent         = 'ALERT';
+  statusText.className           = 'alert';
+  statusIcon.textContent         = '👁️';
+  meterFill.style.background     = 'var(--alert-color)';
   statusBarFill.style.background = 'var(--alert-color)';
+  alertOverlay.classList.remove('active');
 }
 
-function setDrowsy(confidence) {
-  statusText.textContent = 'DROWSY!';
-  statusText.className   = 'drowsy';
-  statusIcon.textContent = '😴';
-  alertOverlay.classList.add('active');
-  meterFill.style.background = 'var(--danger-color)';
+function setStateDrowsy() {
+  statusText.textContent         = 'DROWSY!';
+  statusText.className           = 'drowsy';
+  statusIcon.textContent         = '😴';
+  meterFill.style.background     = 'var(--danger-color)';
   statusBarFill.style.background = 'var(--danger-color)';
+  alertOverlay.classList.add('active');
 }
 
-function setBuffering(fill) {
+function setStateBuffering() {
   statusText.textContent = 'WARMING UP';
   statusText.className   = 'warn';
   statusIcon.textContent = '⏳';
   alertOverlay.classList.remove('active');
 }
 
-function setNoFace() {
+function setStateNoFace() {
   statusText.textContent = 'NO FACE';
   statusText.className   = '';
   statusIcon.textContent = '🔍';
   alertOverlay.classList.remove('active');
 }
 
-function setStandby() {
-  statusText.textContent = 'STANDBY';
-  statusText.className   = '';
-  statusIcon.textContent = '😐';
-  confValue.textContent  = '--.-%';
-  meterFill.style.width  = '0%';
-  bufferFill.style.width = '0%';
-  bufferLabel.textContent = `BUFFER: 0 / ${SEQ_LEN}`;
+function setStateCalibrating() {
+  statusText.textContent = 'CALIBRATING';
+  statusText.className   = 'warn';
+  statusIcon.textContent = '📡';
   alertOverlay.classList.remove('active');
+}
+
+function setStateStandby() {
+  statusText.textContent   = 'STANDBY';
+  statusText.className     = '';
+  statusIcon.textContent   = '😐';
+  confValue.textContent    = '--.-%';
+  meterFill.style.width    = '0%';
+  bufferFill.style.width   = '0%';
+  bufferLabel.textContent  = `BUFFER: 0 / ${BUF_TOTAL}`;
   statusBarFill.style.width = '0%';
+  alertOverlay.classList.remove('active');
 }
 
 function updateConfidence(confidence) {
   const pct = Math.round(confidence * 100);
-  confValue.textContent    = `${pct}%`;
-  meterFill.style.width    = `${pct}%`;
+  confValue.textContent     = `${pct}%`;
+  meterFill.style.width     = `${pct}%`;
   statusBarFill.style.width = `${pct}%`;
 }
 
-function updateBuffer(fill) {
-  const pct = Math.round((fill / SEQ_LEN) * 100);
+function updateBuffer(fill, total) {
+  const pct = Math.round((fill / total) * 100);
   bufferFill.style.width  = `${pct}%`;
-  bufferLabel.textContent = `BUFFER: ${fill} / ${SEQ_LEN}`;
+  bufferLabel.textContent = `BUFFER: ${fill} / ${total}`;
 }
 
-// ── FPS counter ───────────────────────────────────────────────────────────────
-function updateFPS() {
+function updateThresholdBadge(threshold) {
+  if (threshold == null) return;
+  const pct = Math.round(threshold * 100);
+  const tag = personalThresh ? 'PERSONAL' : 'DEFAULT';
+  thresholdVal.textContent = `${tag} (${pct}%)`;
+}
+
+// ── FPS ───────────────────────────────────────────────────────────────────────
+function tickFPS() {
   frameCount++;
-  const now     = Date.now();
-  const elapsed = (now - fpsTimer) / 1000;
-  if (elapsed >= 2) {
-    fpsLabel.textContent = `${(frameCount / elapsed).toFixed(1)} FPS`;
+  const now = Date.now();
+  if (now - fpsTimer >= 2000) {
+    fpsLabel.textContent = `${(frameCount / ((now - fpsTimer) / 1000)).toFixed(1)} FPS`;
     frameCount = 0;
     fpsTimer   = now;
   }
 }
 
-// ── Send one frame ────────────────────────────────────────────────────────────
-async function sendFrame() {
-  if (!video.srcObject || video.readyState < 2) return;
+// ── Frame capture ─────────────────────────────────────────────────────────────
+function captureBlob() {
+  return new Promise((resolve) => {
+    if (!video.srcObject || video.readyState < 2) return resolve(null);
+    // Un-mirror the video so face detection sees correct orientation
+    ctx.save();
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, -224, 0, 224, 224);
+    ctx.restore();
+    canvas.toBlob(resolve, 'image/jpeg', 0.8);
+  });
+}
 
-  // Draw to canvas (mirrored back for correct face detection)
-  ctx.save();
-  ctx.scale(-1, 1);
-  ctx.drawImage(video, -224, 0, 224, 224);
-  ctx.restore();
+// ── POST frame ────────────────────────────────────────────────────────────────
+async function postFrame(endpoint, blob) {
+  const form = new FormData();
+  form.append('frame', blob, 'frame.jpg');
+  const res = await fetch(`${API_URL}${endpoint}`, {
+    method:  'POST',
+    headers: { 'x-session-id': SESSION_ID },
+    body:    form,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
 
-  canvas.toBlob(async (blob) => {
+// ── Calibration tick ──────────────────────────────────────────────────────────
+async function calibrationTick() {
+  if (sending) return;         // skip if previous frame still in flight
+  sending = true;
+
+  try {
+    const blob = await captureBlob();
     if (!blob) return;
 
-    try {
-      const form = new FormData();
-      form.append('frame', blob, 'frame.jpg');
+    const data = await postFrame('/calibrate', blob);
+    tickFPS();
 
-      const res  = await fetch(`${API_URL}/predict`, {
-        method:  'POST',
-        headers: { 'x-session-id': SESSION_ID },
-        body:    form,
-      });
-
-      if (!res.ok) { log(`API error ${res.status}`, 'danger'); return; }
-
-      const data = await res.json();
-      handleResult(data);
-      updateFPS();
-
-    } catch (err) {
-      log(`Network error: ${err.message}`, 'danger');
+    if (data.status === 'no_face_reset') {
+      updateCalRing(0, CAL_TOTAL, true);
+      log('⚠ Face lost — calibration reset', 'warn');
+      return;
     }
-  }, 'image/jpeg', 0.8);
-}
 
-// ── Handle API result ─────────────────────────────────────────────────────────
-function handleResult(data) {
-  const { status, drowsy, confidence, buffer_fill } = data;
+    if (data.status === 'collecting') {
+      updateCalRing(data.collected, data.target, false);
+      return;
+    }
 
-  if (status === 'buffering') {
-    setBuffering(buffer_fill);
-    updateBuffer(buffer_fill ?? 0);
-    return;
-  }
+    if (data.status === 'complete') {
+      personalThresh = data.threshold;
+      updateThresholdBadge(data.threshold);
+      calComplete(data.threshold);
+      log(`✓ Calibrated — threshold ${Math.round(data.threshold * 100)}%`, 'ok');
 
-  if (status === 'no_face') {
-    setNoFace();
-    updateBuffer(buffer_fill ?? 0);
-    return;
-  }
-
-  if (status === 'ok') {
-    updateBuffer(SEQ_LEN);
-    updateConfidence(confidence);
-
-    if (drowsy) {
-      setDrowsy(confidence);
-      if (!lastDrowsy) {
-        drowsyStart = new Date();
-        log(`⚠ Drowsiness detected — conf ${Math.round(confidence * 100)}%`, 'danger');
-      }
-    } else {
-      setAlert();
-      if (lastDrowsy && drowsyStart) {
-        const secs = ((Date.now() - drowsyStart) / 1000).toFixed(1);
-        log(`✓ Alert resumed — drowsy for ${secs}s`, 'ok');
+      // Switch to inference after animation
+      setTimeout(() => {
+        appPhase    = 'monitoring';
+        lastDrowsy  = false;
         drowsyStart = null;
-      }
+        setStateBuffering();
+      }, 1800);
     }
 
-    lastDrowsy = drowsy;
+  } catch (err) {
+    log(`Calibration error: ${err.message}`, 'danger');
+  } finally {
+    sending = false;
   }
 }
 
-// ── Start monitoring ──────────────────────────────────────────────────────────
-async function startMonitor() {
+// ── Inference tick ────────────────────────────────────────────────────────────
+async function inferenceTick() {
+  if (sending) return;         // skip if previous frame still in flight
+  sending = true;
+
+  try {
+    const blob = await captureBlob();
+    if (!blob) return;
+
+    const data = await postFrame('/predict', blob);
+    tickFPS();
+
+    const { status, drowsy, confidence, buffer_fill, threshold } = data;
+    updateThresholdBadge(threshold);
+
+    if (status === 'buffering') {
+      setStateBuffering();
+      updateBuffer(buffer_fill ?? 0, BUF_TOTAL);
+      return;
+    }
+
+    if (status === 'no_face') {
+      setStateNoFace();
+      updateBuffer(buffer_fill ?? 0, BUF_TOTAL);
+      return;
+    }
+
+    if (status === 'ok') {
+      updateBuffer(BUF_TOTAL, BUF_TOTAL);
+      updateConfidence(confidence);
+
+      if (drowsy) {
+        setStateDrowsy();
+        if (!lastDrowsy) {
+          drowsyStart = Date.now();
+          log(`⚠ Drowsy detected — ${Math.round(confidence * 100)}% (thresh ${Math.round(threshold * 100)}%)`, 'danger');
+        }
+      } else {
+        setStateAlert();
+        if (lastDrowsy && drowsyStart) {
+          const secs = ((Date.now() - drowsyStart) / 1000).toFixed(1);
+          log(`✓ Alert resumed — episode ${secs}s`, 'ok');
+          drowsyStart = null;
+        }
+      }
+      lastDrowsy = drowsy;
+    }
+
+  } catch (err) {
+    log(`Inference error: ${err.message}`, 'danger');
+  } finally {
+    sending = false;
+  }
+}
+
+// ── Master tick ───────────────────────────────────────────────────────────────
+async function tick() {
+  if (appPhase === 'calibrating') await calibrationTick();
+  else if (appPhase === 'monitoring') await inferenceTick();
+}
+
+// ── Start session ─────────────────────────────────────────────────────────────
+async function startSession() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 480, facingMode: 'user' },
@@ -214,47 +327,57 @@ async function startMonitor() {
     btnStart.disabled = true;
     btnStop.disabled  = false;
 
-    log('▶ Monitoring started', 'ok');
-    intervalId = setInterval(sendFrame, FRAME_MS);
+    // Reset calibration overlay
+    calOverlay.classList.remove('hidden', 'reset', 'done');
+    calTitle.textContent    = 'Calibrating';
+    calSubtitle.textContent = 'SIT NORMALLY & FACE THE CAMERA\nESTABLISHING YOUR ALERT BASELINE';
+    calRingFill.style.strokeDashoffset = RING_C.toFixed(1);
+    calCount.textContent = '30';
+
+    appPhase = 'calibrating';
+    setStateCalibrating();
+    log('📡 Calibration started — sit normally for 30s', 'warn');
+
+    intervalId = setInterval(tick, FRAME_MS);
 
   } catch (err) {
     log(`Camera error: ${err.message}`, 'danger');
   }
 }
 
-// ── Stop monitoring ───────────────────────────────────────────────────────────
-async function stopMonitor() {
+// ── Stop session ──────────────────────────────────────────────────────────────
+async function stopSession() {
   clearInterval(intervalId);
-  intervalId = null;
+  intervalId     = null;
+  appPhase       = 'idle';
+  sending        = false;
+  personalThresh = null;
+  lastDrowsy     = false;
+  drowsyStart    = null;
 
   if (stream) {
     stream.getTracks().forEach(t => t.stop());
     stream = null;
   }
-
   video.srcObject = null;
-  lastDrowsy      = false;
-  drowsyStart     = null;
 
-  btnStart.disabled = false;
-  btnStop.disabled  = true;
-  fpsLabel.textContent = '-- FPS';
+  showCalOverlay(false);
+  btnStart.disabled        = false;
+  btnStop.disabled         = true;
+  fpsLabel.textContent     = '-- FPS';
+  thresholdVal.textContent = 'DEFAULT (50%)';
 
-  setStandby();
-  log('■ Monitoring stopped');
+  setStateStandby();
+  log('■ Session stopped');
 
-  // Clean up server-side buffer
+  // Clean up server-side session
   fetch(`/session/${SESSION_ID}`, { method: 'DELETE' }).catch(() => {});
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
-btnStart.addEventListener('click', startMonitor);
-btnStop.addEventListener('click',  stopMonitor);
+btnStart.addEventListener('click', startSession);
+btnStop.addEventListener('click',  stopSession);
 
-// Warn before leaving page while monitoring
 window.addEventListener('beforeunload', (e) => {
-  if (intervalId) {
-    e.preventDefault();
-    e.returnValue = '';
-  }
+  if (intervalId) { e.preventDefault(); e.returnValue = ''; }
 });
