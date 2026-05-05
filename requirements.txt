@@ -1,9 +1,12 @@
 # ─────────────────────────────────────────────────────
 # requirements.txt — Render (Linux) deployment
 # ─────────────────────────────────────────────────────
-tensorflow-cpu==2.17.0
+tensorflow-cpu==2.16.2
 fastapi
 uvicorn[standard]
 python-multipart
-opencv-python-headless
-numpy
+opencv-python-headless==4.9.0.80
+opencv-contrib-python-headless==4.9.0.80
+mediapipe==0.10.21
+numpy==1.26.4
+ml-dtypes==0.3.2
