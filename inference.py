@@ -21,7 +21,8 @@ LARGE_BUF_LEN  = 60      # holds enough frames for 3 overlapping windows
 STRIDE         = 15      # window stride: windows start at 0, 15, 30 in the 60-buf
 K_SIGMA        = 2.5     # threshold = cal_mean + K_SIGMA * cal_std
 DEFAULT_THRESH = 0.50    # fallback if no calibration
-CAL_WARMUP     = 60      # discard first 60 probs (buffer not full = noisy)
+CAL_WARMUP     = 30      # discard first 30 probs (buffer not full = noisy)
+CAL_TARGET     = 150     # 150 good frames — ~30s at ~5fps on Render free tier
 
 # ── Lazy globals (loaded once on first use) ───────────────────────────────────
 _face_cascade = None
@@ -35,9 +36,10 @@ class SessionState:
     feature_buf: deque = field(default_factory=lambda: deque(maxlen=LARGE_BUF_LEN))
 
     # Calibration
-    cal_probs:   list  = field(default_factory=list)  # alert-state LSTM probs
-    cal_done:    bool  = False
-    threshold:   float = DEFAULT_THRESH
+    cal_probs:          list  = field(default_factory=list)
+    cal_done:           bool  = False
+    threshold:          float = DEFAULT_THRESH
+    consecutive_no_face: int  = 0   # only reset after N consecutive misses
 
 
 # Per-session state store
@@ -56,9 +58,11 @@ def _load_models():
     import tensorflow as tf
     from tensorflow.keras.applications import MobileNetV2
 
-    print("⏳ Loading face cascade...")
-    _face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    print("⏳ Loading MediaPipe face detector...")
+    import mediapipe as mp
+    _face_cascade = mp.solutions.face_detection.FaceDetection(
+        model_selection=0,       # 0 = short range (< 2m) — webcam use case
+        min_detection_confidence=0.5
     )
 
     # MobileNetV2 — prefer saved file, else download weights
@@ -76,7 +80,7 @@ def _load_models():
     # tf.keras.models.load_model handles both folder and single-file formats
     # as long as we pass the correct path type.
     lstm_path = None
-    for candidate in [ "best_model.h5","best_model.keras"]:
+    for candidate in ["best_model.h5","best_model.keras"]:
         p = Path(candidate)
         if p.exists():          # exists() is True for both files AND folders
             lstm_path = str(p)
@@ -109,24 +113,38 @@ def clear_session(session_id: str):
 
 def _extract_face_feature(frame_bgr: np.ndarray) -> Optional[np.ndarray]:
     """
-    Detect largest face, crop, run MobileNetV2.
+    Detect face using MediaPipe (handles tilts, nods, partial faces),
+    crop, run MobileNetV2.
     Returns (1280,) feature vector or None if no face found.
     """
     from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
-    gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = _face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+    h, w = frame_bgr.shape[:2]
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    results   = _face_cascade.process(frame_rgb)
 
-    if len(faces) == 0:
+    if not results.detections:
         return None
 
-    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-    face = frame_bgr[y:y+h, x:x+w]
+    # Pick detection with highest confidence
+    det = max(results.detections, key=lambda d: d.score[0])
+    bb  = det.location_data.relative_bounding_box
+
+    # Convert relative coords to absolute — clamp to frame bounds
+    x1 = max(0, int(bb.xmin * w))
+    y1 = max(0, int(bb.ymin * h))
+    x2 = min(w, int((bb.xmin + bb.width)  * w))
+    y2 = min(h, int((bb.ymin + bb.height) * h))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    face = frame_bgr[y1:y2, x1:x2]
     face = cv2.resize(face, (224, 224))
     face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
 
-    inp  = preprocess_input(face.astype(np.float32))[np.newaxis]   # (1,224,224,3)
-    feat = _cnn.predict(inp, verbose=0)[0]                          # (1280,)
+    inp  = preprocess_input(face.astype(np.float32))[np.newaxis]
+    feat = _cnn.predict(inp, verbose=0)[0]
     return feat
 
 
@@ -188,16 +206,29 @@ def calibrate_frame(jpeg_bytes: bytes, session_id: str) -> dict:
 
     feat = _extract_face_feature(frame)
 
-    # ── No face → reset ───────────────────────────────────────────────────────
+    # ── No face → only reset after 5 consecutive misses ──────────────────────
     if feat is None:
-        session.cal_probs.clear()
-        session.feature_buf.clear()
+        session.consecutive_no_face += 1
+        if session.consecutive_no_face >= 5:
+            session.cal_probs.clear()
+            session.feature_buf.clear()
+            session.consecutive_no_face = 0
+            return {
+                "status":    "no_face_reset",
+                "collected": 0,
+                "target":    CAL_TARGET,
+                "threshold": None,
+            }
+        # Not enough consecutive misses yet — keep collecting, return current state
         return {
-            "status":    "no_face_reset",
-            "collected": 0,
-            "target":    SEQ_LEN * 10,   # 300 frames @ 10fps = 30s
+            "status":    "collecting",
+            "collected": len(session.cal_probs),
+            "target":    CAL_TARGET,
             "threshold": None,
         }
+
+    # Face found — reset consecutive counter
+    session.consecutive_no_face = 0
 
     # Accumulate feature in buffer (we need SEQ_LEN to run LSTM)
     session.feature_buf.append(feat)
@@ -211,11 +242,10 @@ def calibrate_frame(jpeg_bytes: bytes, session_id: str) -> dict:
            len(session.feature_buf) >= LARGE_BUF_LEN:
             session.cal_probs.append(prob)
 
-    target    = SEQ_LEN * 10   # 300 good frames = 30s @ 10fps
     collected = len(session.cal_probs)
 
     # ── Calibration complete ──────────────────────────────────────────────────
-    if collected >= target:
+    if collected >= CAL_TARGET:
         probs_arr = np.array(session.cal_probs)
         cal_mean  = float(probs_arr.mean())
         cal_std   = float(probs_arr.std())
@@ -228,8 +258,8 @@ def calibrate_frame(jpeg_bytes: bytes, session_id: str) -> dict:
         ))
         session.threshold = personal_thresh
         session.cal_done  = True
-        session.cal_probs.clear()    # free memory
-        session.feature_buf.clear()  # fresh start for inference
+        session.cal_probs.clear()
+        session.feature_buf.clear()
 
         print(f"✅ Calibration complete — session={session_id[:8]} "
               f"mean={cal_mean:.3f} std={cal_std:.3f} "
@@ -238,9 +268,16 @@ def calibrate_frame(jpeg_bytes: bytes, session_id: str) -> dict:
         return {
             "status":    "complete",
             "collected": collected,
-            "target":    target,
+            "target":    CAL_TARGET,
             "threshold": round(personal_thresh, 4),
         }
+
+    return {
+        "status":    "collecting",
+        "collected": collected,
+        "target":    CAL_TARGET,
+        "threshold": None,
+    }
 
     return {
         "status":    "collecting",

@@ -14,7 +14,7 @@
 const API_URL    = '';
 const FRAME_MS   = 100;               // 10fps
 const SESSION_ID = crypto.randomUUID();
-const CAL_TOTAL  = 300;               // 300 frames @ 10fps = 30s
+const CAL_TOTAL  = 150;               // must match server CAL_TARGET (150 frames ~ 30s on Render)
 const BUF_TOTAL  = 60;                // large buffer for 3 overlapping windows
 const RING_C     = 2 * Math.PI * 50; // SVG circle r=50 circumference ≈ 314
 
